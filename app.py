@@ -1173,8 +1173,10 @@ if __name__ == "__main__":
 </body>
 </html>""")
     
-    print("→ open http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    import os
+    port = int(os.environ.get("PORT", 8000))
+    print(f"→ Starting on port {port}")
+    uvicorn.run(app, host="0.0.0.0", port=port)
 
 # Test function for debugging individual references
 def test_single_reference(ref_text: str):
