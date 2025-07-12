@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Ruby – PubMed Reference Verifier (Async Version - Pre-Batching)
+Ruby – PubMed Reference Verifier (Fixed version)
 """
-import re, time, unicodedata, asyncio
+import re, time, unicodedata
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
-import aiohttp, uvicorn
+import requests, uvicorn
 from Bio import Entrez
 from fastapi import FastAPI, Form, Request
 from fastapi.responses import HTMLResponse
@@ -15,22 +15,11 @@ from jinja2 import TemplateNotFound
 from rapidfuzz import fuzz
 
 # ───────────────────────── SETTINGS ──────────────────────────
-import os
-try:
-    from dotenv import load_dotenv
-    load_dotenv()
-except ImportError:
-    pass
-
-Entrez.email = os.environ.get("NCBI_EMAIL", "research@example.com")
-Entrez.api_key = os.environ.get("NCBI_API_KEY")
-
-# Conservative rate limiting to avoid 429 errors
-RATE_LIMIT_SEC = 0.2 if os.environ.get("NCBI_API_KEY") else 0.5
-SEARCH_RETMAX = 200  # Increased retrieval
-STRICT_THRESHOLD = 88
-LOOSE_THRESHOLD = 75
-MAX_CONCURRENT = 3  # Conservative concurrent processing
+Entrez.email      = "rperlis@gmail.com"
+RATE_LIMIT_SEC    = 0.34          # polite delay
+SEARCH_RETMAX     = 50            # fetch up to 50 ids
+STRICT_THRESHOLD  = 88
+LOOSE_THRESHOLD   = 75
 
 # ───────────────────────── DATA ──────────────────────────────
 @dataclass
@@ -40,7 +29,7 @@ class Reference:
     first_author: str
     year: str
     pmid: Optional[str] = None
-    status: str = "UNMATCHED"
+    status: str = "UNMATCHED"      # MATCHED / AMBIGUOUS / UNMATCHED
     pubmed_title: str = ""
     pubmed_first_author: str = ""
     pubmed_year: str = ""
@@ -62,6 +51,7 @@ def clean_title_for_query(title: str) -> str:
     title = re.sub(r"\s+", " ", title).strip()
     
     # Remove ALL types of quotes and other characters that can interfere with PubMed search
+    # Using character escapes to avoid quote conflicts
     quote_pattern = r'["\u201C\u201D\u2018\u2019\u0060\u2033\u201F\u201E\u201A\u2032\u201B]'
     title = re.sub(quote_pattern, '', title)
     
@@ -71,24 +61,13 @@ def clean_title_for_query(title: str) -> str:
     # Clean up multiple spaces
     title = re.sub(r"\s+", " ", title).strip()
     
+    print(f"    Cleaned title: '{title}'")  # Debug output
     return title
 
 def best_similarity(a: str, b: str) -> int:
     return max(fuzz.token_set_ratio(a, b),
                fuzz.partial_ratio(a, b),
                fuzz.QRatio(a, b))
-
-def extract_key_words(title: str, max_words: int = 3) -> List[str]:
-    """Extract key words from title, removing stop words"""
-    title_words = re.findall(r'\b[A-Za-z]{4,}\b', title.lower())
-    stop_words = {'with', 'from', 'this', 'that', 'they', 'have', 'were', 'been', 
-                  'their', 'said', 'each', 'which', 'what', 'there', 'will', 'would', 
-                  'only', 'other', 'when', 'time', 'very', 'also', 'your', 'work', 
-                  'life', 'should', 'after', 'being', 'made', 'before', 'here', 
-                  'through', 'than', 'where', 'among', 'most', 'study', 'analysis',
-                  'using', 'based', 'data', 'results', 'effects', 'patients'}
-    key_words = [w for w in title_words if w not in stop_words][:max_words]
-    return key_words
 
 # ───────────────────────── IMPROVED PARSER ────────────────────────────
 def parse_reference_line(line: str) -> Reference:
@@ -106,20 +85,24 @@ def parse_reference_line(line: str) -> Reference:
     
     # Check if this looks like a web article/non-journal reference
     if re.search(r"(Accessed|Available|Retrieved|https?://|www\.)", line_clean):
+        # For web articles, try to extract title and author differently
         parts = [p.strip() for p in line_clean.split(".") if p.strip()]
         if len(parts) >= 1:
             first_part = parts[0]
+            # Check if first part has author pattern (LastName InitialInitial)
             author_match = re.search(r"^([A-Z][a-z]+(?:\s+[A-Z]+)*)", first_part)
             if author_match and re.search(r"[A-Z][a-z]+\s+[A-Z]", first_part):
                 first_author = author_match.group(1)
                 title = parts[1] if len(parts) > 1 else ""
             else:
+                # Assume first part is title for web articles
                 title = first_part
                 first_author = ""
         else:
             title = line_clean
             first_author = ""
         
+        # Web articles should be marked as ambiguous since they're not journal articles
         return Reference(raw=original, title=title, first_author=first_author, year=year, status="AMBIGUOUS")
     
     # For journal articles, split by periods
@@ -134,7 +117,11 @@ def parse_reference_line(line: str) -> Reference:
     title = ""
     first_author = ""
     
+    print(f"  Analyzing first part: '{first_part}'")  # Debug
+    
     # Pattern matching for different author formats
+    # Look for various author patterns more comprehensively
+    
     # Pattern 1: Standard format with initials - "Smith J" or "Smith JA" or "Smith J, Jones K"
     author_pattern1 = re.search(r"^([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\s+([A-Z]{1,3})(?:[,\s]|$)", first_part)
     
@@ -153,151 +140,78 @@ def parse_reference_line(line: str) -> Reference:
     if author_pattern1:
         first_author = author_pattern1.group(1)
         title = parts[1] if len(parts) > 1 else ""
+        print(f"    Pattern 1 match - Author: '{first_author}'")
     elif author_pattern2:
         first_author = author_pattern2.group(1)
         title = parts[1] if len(parts) > 1 else ""
+        print(f"    Pattern 2 match (et al) - Author: '{first_author}'")
     elif author_pattern4:
         first_author = author_pattern4.group(1)
         title = parts[1] if len(parts) > 1 else ""
-    elif author_pattern3 and not re.search(r"^(The|A|An)\s", first_part):
+        print(f"    Pattern 4 match (Lastname, First) - Author: '{first_author}'")
+    elif author_pattern3 and not re.search(r"^(The|A|An)\s", first_part):  # Avoid titles starting with articles
         first_author = author_pattern3.group(1)
         title = parts[1] if len(parts) > 1 else ""
+        print(f"    Pattern 3 match (full name) - Author: '{first_author}'")
     elif org_pattern:
+        # Organization author - use first few words as "author"
         org_match = re.search(r"^([^.]+)", first_part)
-        first_author = org_match.group(1)[:50] if org_match else ""
+        first_author = org_match.group(1)[:50] if org_match else ""  # Limit length
         title = parts[1] if len(parts) > 1 else ""
+        print(f"    Organization author - Author: '{first_author}'")
     else:
+        # No clear author pattern found - assume first part is title
         title = first_part
         first_author = ""
+        print(f"    No author pattern found - treating as title")
         
         # Try to find author in subsequent parts
         for i, part in enumerate(parts[1:], 1):
+            # Look for author patterns in later parts
             later_author = re.search(r"^([A-Z][a-z]+(?:-[A-Z][a-z]+)?)\s+[A-Z]{1,3}", part)
             if later_author:
                 first_author = later_author.group(1)
+                print(f"    Found author in part {i+1}: '{first_author}'")
                 break
     
+    print(f"  Final parsing - Title: '{title[:50]}...', Author: '{first_author}', Year: '{year}'")
     return Reference(raw=original, title=title, first_author=first_author, year=year)
 
-# ───────────────────────── ASYNC PUBMED HELPERS ─────────────────────
-async def esearch_async(session: aiohttp.ClientSession, term: str, retries: int = 3) -> List[str]:
-    """Async version of PubMed search with retry logic"""
+# ───────────────────────── PUBMED HELPERS ────────────────────
+def esearch(term: str) -> List[str]:
     url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
-    params = {
-        "db": "pubmed", 
-        "retmode": "json",
-        "retmax": SEARCH_RETMAX, 
-        "term": term
-    }
-    
-    if Entrez.api_key:
-        params["api_key"] = Entrez.api_key
-    
-    for attempt in range(retries):
-        try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                if response.status == 429:  # Too Many Requests
-                    wait_time = (2 ** attempt) * 1.0  # Exponential backoff: 1s, 2s, 4s
-                    print(f"Rate limited, waiting {wait_time}s before retry {attempt + 1}/{retries}")
-                    await asyncio.sleep(wait_time)
-                    continue
-                
-                response.raise_for_status()
-                data = await response.json()
-                return data.get("esearchresult", {}).get("idlist", [])
-                
-        except aiohttp.ClientError as e:
-            if attempt == retries - 1:  # Last attempt
-                print(f"Search error for term '{term}': {e}")
-                return []
-            else:
-                wait_time = (2 ** attempt) * 0.5
-                await asyncio.sleep(wait_time)
-        except Exception as e:
-            print(f"Search error for term '{term}': {e}")
-            return []
-    
-    return []
+    params = {"db": "pubmed", "retmode": "json",
+              "retmax": SEARCH_RETMAX, "term": term}
+    try:
+        response = requests.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        return response.json().get("esearchresult", {}).get("idlist", [])
+    except Exception as e:
+        print(f"Search error for term '{term}': {e}")
+        return []
 
-async def esummary_async(session: aiohttp.ClientSession, pmids: List[str], retries: int = 3) -> Dict[str, Dict]:
-    """Async version of PubMed summary with retry logic"""
+def esummary(pmids: List[str]) -> Dict[str, Dict]:
     if not pmids:
         return {}
-    
     url = "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi"
-    params = {
-        "db": "pubmed", 
-        "retmode": "json", 
-        "id": ",".join(pmids)
-    }
-    
-    if Entrez.api_key:
-        params["api_key"] = Entrez.api_key
-    
-    for attempt in range(retries):
-        try:
-            async with session.get(url, params=params, timeout=aiohttp.ClientTimeout(total=15)) as response:
-                if response.status == 429:  # Too Many Requests
-                    wait_time = (2 ** attempt) * 1.0  # Exponential backoff
-                    print(f"Rate limited on summary, waiting {wait_time}s before retry {attempt + 1}/{retries}")
-                    await asyncio.sleep(wait_time)
-                    continue
-                
-                response.raise_for_status()
-                data = await response.json()
-                res = data.get("result", {})
-                return {pid: res[pid] for pid in pmids if pid in res and isinstance(res[pid], dict)}
-                
-        except aiohttp.ClientError as e:
-            if attempt == retries - 1:  # Last attempt
-                print(f"Summary error for PMIDs {pmids}: {e}")
-                return {}
-            else:
-                wait_time = (2 ** attempt) * 0.5
-                await asyncio.sleep(wait_time)
-        except Exception as e:
-            print(f"Summary error for PMIDs {pmids}: {e}")
-            return {}
-    
-    return {}
+    params = {"db": "pubmed", "retmode": "json", "id": ",".join(pmids)}
+    try:
+        data = requests.get(url, params=params, timeout=15).json()
+    except Exception as e:
+        print(f"Summary error for PMIDs {pmids}: {e}")
+        return {}
+    res = data.get("result", {})
+    return {pid: res[pid] for pid in pmids if pid in res and isinstance(res[pid], dict)}
 
 def _commit(ref: Reference, summ: Dict, status: str, pmid: str) -> Reference:
     ref.status = status
-    ref.pmid = pmid
-    ref.pubmed_title = summ.get("title", "")
+    ref.pmid   = pmid
+    ref.pubmed_title        = summ.get("title", "")
     ref.pubmed_first_author = summ.get("authors", [{}])[0].get("name", "") if summ.get("authors") else ""
-    ref.pubmed_year = summ.get("pubdate", "")[:4] if summ.get("pubdate") else ""
+    ref.pubmed_year         = summ.get("pubdate", "")[:4] if summ.get("pubdate") else ""
     return ref
 
-async def try_search_strategy(session: aiohttp.ClientSession, ref: Reference, search_term: str, strategy_name: str) -> Optional[Reference]:
-    """Try a single search strategy and return result if successful"""
-    print(f"  {strategy_name}: {search_term}")
-    
-    ids = await esearch_async(session, search_term)
-    if not ids:
-        return None
-    
-    # Small delay between search and summary
-    await asyncio.sleep(RATE_LIMIT_SEC)
-    
-    summ = await esummary_async(session, ids)
-    if not summ:
-        return None
-    
-    best_id = max(summ, key=lambda pid: best_similarity(ref.title.lower(), summ[pid].get("title", "").lower()))
-    score = best_similarity(ref.title.lower(), summ[best_id].get("title", "").lower())
-    
-    print(f"    Best match score: {score}")
-    
-    if score >= STRICT_THRESHOLD:
-        return _commit(ref, summ[best_id], "MATCHED", best_id)
-    elif score >= LOOSE_THRESHOLD:
-        return _commit(ref, summ[best_id], "AMBIGUOUS", best_id)
-    
-    return None
-
-async def match_against_pubmed_async(session: aiohttp.ClientSession, ref: Reference) -> Reference:
-    """Async version with sequential search strategies"""
+def match_against_pubmed(ref: Reference) -> Reference:
     if ref.status == "AMBIGUOUS" or not ref.title.strip():
         print(f"    Skipping PubMed search - status: {ref.status}, title empty: {not ref.title.strip()}")
         return ref
@@ -305,85 +219,130 @@ async def match_against_pubmed_async(session: aiohttp.ClientSession, ref: Refere
     title_q = clean_title_for_query(ref.title)
     print(f"Processing: {ref.title[:50]}... (Author: {ref.first_author}, Year: {ref.year})")
 
-    # Quick exit for references without enough info
-    if not ref.first_author and not ref.year and len(extract_key_words(title_q)) < 2:
-        print("  Insufficient information for reliable matching")
-        ref.status = "UNMATCHED"
-        return ref
-
-    key_words = extract_key_words(title_q, 3)
-    
-    # All 5 strategies in priority order - try sequentially and stop at first good match
-    strategies = []
-    
-    # Strategy 1: Title keywords + Author + Year (highest precision)
-    if ref.first_author and ref.year and key_words:
-        strategies.append((
-            f'{" ".join(key_words)} AND {ref.first_author}[AUTH] AND {ref.year}[DP]',
-            "Keywords+Author+Year"
-        ))
-    
-    # Strategy 2: Author + Year (high precision for unique authors)
-    if ref.first_author and ref.year:
-        strategies.append((
-            f'{ref.first_author}[AUTH] AND {ref.year}[DP]',
-            "Author+Year"
-        ))
-    
-    # Strategy 3: Title keywords + Author (no year restriction)
-    if ref.first_author and key_words:
-        strategies.append((
-            f'{" ".join(key_words)} AND {ref.first_author}[AUTH]',
-            "Keywords+Author"
-        ))
-    
-    # Strategy 4: Natural language search (broader)
-    if ref.first_author and ref.year and key_words:
-        strategies.append((
-            f'{ref.first_author} {ref.year} {" ".join(key_words)}',
-            "Natural Language"
-        ))
-    
-    # Strategy 5: Title keywords only (for papers without clear authors)
-    if key_words:
-        extended_keywords = extract_key_words(title_q, 4 if not ref.first_author else 3)
-        strategies.append((
-            ' '.join(extended_keywords),
-            "Keywords Only"
-        ))
-
-    # Try strategies in order, stopping at first successful match
-    for i, (search_term, strategy_name) in enumerate(strategies):
-        result = await try_search_strategy(session, ref, search_term, strategy_name)
-        if result and result.status in ["MATCHED", "AMBIGUOUS"]:
-            return result
+    # Strategy 1: Multi-author search (for common surnames like Li, Wang, etc.)
+    if ref.first_author and ref.year and len(ref.first_author) <= 4:  # Common surnames are usually short
+        # Extract key words from title and combine with author + year
+        title_words = re.findall(r'\b[A-Za-z]{4,}\b', title_q.lower())
+        stop_words = {'with', 'from', 'this', 'that', 'they', 'have', 'were', 'been', 'their', 'said', 'each', 'which', 'what', 'there', 'will', 'would', 'only', 'other', 'when', 'time', 'very', 'also', 'your', 'work', 'life', 'should', 'after', 'being', 'made', 'before', 'here', 'through', 'than', 'where', 'among', 'most'}
+        key_words = [w for w in title_words if w not in stop_words][:3]
         
-        # Delay between different strategies
-        if i < len(strategies) - 1:  # Don't delay after last strategy
-            await asyncio.sleep(RATE_LIMIT_SEC)
+        if key_words:
+            search1 = f'{" ".join(key_words)} AND {ref.first_author}[AUTH] AND {ref.year}[DP]'
+            print(f"  Keyword+author+year search: {search1}")
+            ids = esearch(search1)
+            if ids:
+                summ = esummary(ids)
+                if summ:
+                    best_id = max(summ, key=lambda pid:
+                                  best_similarity(ref.title.lower(),
+                                                  summ[pid].get("title", "").lower()))
+                    score = best_similarity(ref.title.lower(),
+                                             summ[best_id].get("title", "").lower())
+                    print(f"    Best match score: {score}")
+                    if score >= STRICT_THRESHOLD:
+                        return _commit(ref, summ[best_id], "MATCHED", best_id)
+                    elif score >= LOOSE_THRESHOLD:
+                        return _commit(ref, summ[best_id], "AMBIGUOUS", best_id)
+
+    # Strategy 2: Author + year (if available) - for less common names
+    if ref.first_author and ref.year:
+        search2 = f'{ref.first_author}[AUTH] AND {ref.year}[DP]'
+        print(f"  Author+year search: {search2}")
+        ids = esearch(search2)
+        if ids:
+            summ = esummary(ids)
+            if summ:
+                best_id = max(summ, key=lambda pid:
+                              best_similarity(ref.title.lower(),
+                                              summ[pid].get("title", "").lower()))
+                score = best_similarity(ref.title.lower(),
+                                         summ[best_id].get("title", "").lower())
+                print(f"    Best match score: {score}")
+                if score >= STRICT_THRESHOLD:
+                    return _commit(ref, summ[best_id], "MATCHED", best_id)
+                elif score >= LOOSE_THRESHOLD:
+                    return _commit(ref, summ[best_id], "AMBIGUOUS", best_id)
+
+    # Strategy 3: Title keywords + author (no year restriction)
+    if ref.first_author:
+        title_words = re.findall(r'\b[A-Za-z]{4,}\b', title_q.lower())
+        stop_words = {'with', 'from', 'this', 'that', 'they', 'have', 'were', 'been', 'their', 'said', 'each', 'which', 'what', 'there', 'will', 'would', 'only', 'other', 'when', 'time', 'very', 'also', 'your', 'work', 'life', 'should', 'after', 'being', 'made', 'before', 'here', 'through', 'than', 'where', 'among', 'most'}
+        key_words = [w for w in title_words if w not in stop_words][:3]
+        
+        if key_words:
+            search3 = f'{" ".join(key_words)} AND {ref.first_author}[AUTH]'
+            print(f"  Keywords+author search: {search3}")
+            ids = esearch(search3)
+            if ids:
+                summ = esummary(ids)
+                if summ:
+                    best_id = max(summ, key=lambda pid:
+                                  best_similarity(ref.title.lower(),
+                                                  summ[pid].get("title", "").lower()))
+                    score = best_similarity(ref.title.lower(),
+                                             summ[best_id].get("title", "").lower())
+                    print(f"    Best match score: {score}")
+                    if score >= STRICT_THRESHOLD:
+                        return _commit(ref, summ[best_id], "MATCHED", best_id)
+                    elif score >= LOOSE_THRESHOLD:
+                        return _commit(ref, summ[best_id], "AMBIGUOUS", best_id)
+
+    # Strategy 4: Broad natural language search (no field tags)
+    if ref.first_author and ref.year:
+        title_words = re.findall(r'\b[A-Za-z]{4,}\b', title_q.lower())
+        stop_words = {'with', 'from', 'this', 'that', 'they', 'have', 'were', 'been', 'their', 'said', 'each', 'which', 'what', 'there', 'will', 'would', 'only', 'other', 'when', 'time', 'very', 'also', 'your', 'work', 'life', 'should', 'after', 'being', 'made', 'before', 'here', 'through', 'than', 'where', 'among', 'most'}
+        key_words = [w for w in title_words if w not in stop_words][:3]
+        
+        if key_words:
+            search4 = f'{ref.first_author} {ref.year} {" ".join(key_words)}'
+            print(f"  Natural language search: {search4}")
+            ids = esearch(search4)
+            if ids:
+                summ = esummary(ids)
+                if summ:
+                    best_id = max(summ, key=lambda pid:
+                                  best_similarity(ref.title.lower(),
+                                                  summ[pid].get("title", "").lower()))
+                    score = best_similarity(ref.title.lower(),
+                                             summ[best_id].get("title", "").lower())
+                    print(f"    Best match score: {score}")
+                    if score >= STRICT_THRESHOLD:
+                        return _commit(ref, summ[best_id], "MATCHED", best_id)
+                    elif score >= LOOSE_THRESHOLD:
+                        return _commit(ref, summ[best_id], "AMBIGUOUS", best_id)
+
+    # Strategy 5: Title keywords only (for papers without clear authors)
+    title_words = re.findall(r'\b[A-Za-z]{4,}\b', title_q.lower())
+    stop_words = {'with', 'from', 'this', 'that', 'they', 'have', 'were', 'been', 'their', 'said', 'each', 'which', 'what', 'there', 'will', 'would', 'only', 'other', 'when', 'time', 'very', 'also', 'your', 'work', 'life', 'should', 'after', 'being', 'made', 'before', 'here', 'through', 'than', 'where', 'among', 'most'}
+    key_words = [w for w in title_words if w not in stop_words][:4]
+    
+    if key_words:
+        search5 = ' '.join(key_words)  # Natural language, no AND operators
+        print(f"  Keywords natural language search: {search5}")
+        ids = esearch(search5)
+        if ids:
+            summ = esummary(ids)
+            if summ:
+                best_id = max(summ, key=lambda pid:
+                              best_similarity(ref.title.lower(),
+                                              summ[pid].get("title", "").lower()))
+                score = best_similarity(ref.title.lower(),
+                                         summ[best_id].get("title", "").lower())
+                print(f"    Best match score: {score}")
+                if score >= STRICT_THRESHOLD:
+                    return _commit(ref, summ[best_id], "MATCHED", best_id)
+                elif score >= LOOSE_THRESHOLD:
+                    return _commit(ref, summ[best_id], "AMBIGUOUS", best_id)
 
     ref.status = "UNMATCHED"
     print(f"    No suitable match found - setting status to UNMATCHED")
     return ref
 
-async def process_single_reference_async(session: aiohttp.ClientSession, semaphore: asyncio.Semaphore, ref: Reference, index: int) -> Reference:
-    """Process a single reference with concurrency control"""
-    async with semaphore:
-        print(f"\n--- Processing reference {index} against PubMed ---")
-        original_status = ref.status
-        processed_ref = await match_against_pubmed_async(session, ref)
-        print(f"Status changed from '{original_status}' to '{processed_ref.status}'")
-        return processed_ref
-
-# ───────────────────────── ASYNC MAIN PIPELINE ─────────────────────
-async def process_block_async(text: str) -> List[Reference]:
-    """Main async processing pipeline"""
+# ───────────────────────── MAIN PIPELINE ─────────────────────
+def process_block(text: str) -> List[Reference]:
     lines = [line.strip() for line in text.splitlines() if line.strip()]
     print(f"\nProcessing {len(lines)} non-empty lines")
-    print(f"Using NCBI API key: {'Yes' if Entrez.api_key else 'No'}")
-    print(f"Rate limit: {RATE_LIMIT_SEC}s, Max concurrent: {MAX_CONCURRENT}")
     
-    # Parse all references first (this is fast)
     refs = []
     for i, line in enumerate(lines):
         print(f"\n--- Parsing line {i+1}/{len(lines)} ---")
@@ -396,53 +355,25 @@ async def process_block_async(text: str) -> List[Reference]:
     valid_refs = [r for r in refs if r.raw]
     print(f"\nFound {len(valid_refs)} valid references to process")
     
-    if not valid_refs:
-        return []
-    
-    # Create HTTP session with optimized settings
-    connector = aiohttp.TCPConnector(
-        limit=20,  # Total connection pool size
-        limit_per_host=10,  # Max connections per host
-        ttl_dns_cache=300,  # DNS cache TTL
-        use_dns_cache=True,
-    )
-    
-    timeout = aiohttp.ClientTimeout(total=60, connect=10)
-    
-    async with aiohttp.ClientSession(connector=connector, timeout=timeout) as session:
-        # Use semaphore to limit concurrent requests
-        semaphore = asyncio.Semaphore(MAX_CONCURRENT)
-        
-        # Process all references concurrently
-        tasks = [
-            process_single_reference_async(session, semaphore, ref, i+1) 
-            for i, ref in enumerate(valid_refs)
-        ]
-        
-        # Wait for all tasks to complete
-        processed_refs = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        # Handle any exceptions
-        final_refs = []
-        for i, result in enumerate(processed_refs):
-            if isinstance(result, Exception):
-                print(f"Error processing reference {i+1}: {result}")
-                # Return original reference with error status
-                valid_refs[i].status = "UNMATCHED"
-                final_refs.append(valid_refs[i])
-            else:
-                final_refs.append(result)
+    # Process each reference against PubMed
+    for i, r in enumerate(valid_refs):
+        print(f"\n--- Processing reference {i+1}/{len(valid_refs)} against PubMed ---")
+        original_status = r.status
+        processed_ref = match_against_pubmed(r)
+        print(f"Status changed from '{original_status}' to '{processed_ref.status}'")
+        valid_refs[i] = processed_ref
+        time.sleep(RATE_LIMIT_SEC)
     
     # Debug: Print final status counts
     final_counts = {}
-    for ref in final_refs:
+    for ref in valid_refs:
         final_counts[ref.status] = final_counts.get(ref.status, 0) + 1
     print(f"\nFinal status counts: {final_counts}")
     
-    return final_refs
+    return valid_refs
 
 # ───────────────────────── FASTAPI / HTML ────────────────────
-app = FastAPI()
+app       = FastAPI()
 templates = Jinja2Templates(directory="templates")
 
 @app.get("/", response_class=HTMLResponse)
@@ -459,17 +390,9 @@ async def process_endpoint(request: Request, reference_text: str = Form(...)):
     try:
         print(f"\n{'='*60}")
         print(f"Processing new request with {len(reference_text.splitlines())} lines")
-        print(f"Using NCBI API key: {'Yes' if Entrez.api_key else 'No'}")
-        print(f"Rate limit: {RATE_LIMIT_SEC}s, Max concurrent: {MAX_CONCURRENT}")
         print(f"{'='*60}")
         
-        start_time = time.time()
-        
-        # Use async processing
-        refs = await process_block_async(reference_text)
-        
-        processing_time = time.time() - start_time
-        print(f"\nTotal processing time: {processing_time:.2f} seconds")
+        refs = process_block(reference_text)
         
         # Calculate counts with explicit validation
         matched = 0
@@ -485,7 +408,7 @@ async def process_endpoint(request: Request, reference_text: str = Form(...)):
                 unmatched += 1
             else:
                 print(f"WARNING: Unexpected status '{ref.status}' for reference: {ref.title[:50]}...")
-                unmatched += 1
+                unmatched += 1  # Default unexpected statuses to unmatched
         
         total_processed = matched + ambiguous + unmatched
         print(f"\nFINAL COUNTS:")
@@ -494,7 +417,6 @@ async def process_endpoint(request: Request, reference_text: str = Form(...)):
         print(f"  Unmatched: {unmatched}")
         print(f"  Total: {total_processed}")
         print(f"  References processed: {len(refs)}")
-        print(f"  Average time per reference: {processing_time/max(len(refs), 1):.2f}s")
 
         blocks = []
         for i, r in enumerate(refs, 1):
@@ -504,7 +426,7 @@ async def process_endpoint(request: Request, reference_text: str = Form(...)):
             sym = "✓" if r.status == "MATCHED" else \
                   "?" if r.status == "AMBIGUOUS" else "✗"
             
-            # Clean title for display
+            # Clean title for display (remove any remaining numbering artifacts)
             display_title = re.sub(r'^\d+\.\s*', '', r.title)
             
             blocks.append(
@@ -793,7 +715,7 @@ if __name__ == "__main__":
             align-items: center;
             justify-content: space-between;
             gap: 10px;
-            min-height: 70px;
+            min-height: 70px;  /* ADD THIS LINE */
         }
         
         .section-header .label {
@@ -941,9 +863,9 @@ if __name__ == "__main__":
         .footer {
             text-align: center;
             padding: 20px;
-            color: #4f46e5;
+            color: #4f46e5;  /* CHANGE THIS from rgba(255, 255, 255, 0.8) */
             font-size: 0.85rem;
-            background: linear-gradient(135deg, rgba(79, 70, 229, 0.1) 0%, rgba(102, 102, 241, 0.1) 100%);
+            background: linear-gradient(135deg, rgba(220, 38, 38, 0.1) 0%, rgba(124, 45, 18, 0.1) 100%);
         }
 
         .modal {
@@ -1081,7 +1003,7 @@ if __name__ == "__main__":
     <div class="container">
         <div class="header">
             <h1>Ruby</h1>
-            <p class="subtitle">PubMed Reference Verifier - Async Edition</p>
+            <p class="subtitle">PubMed Reference Verifier</p>
             <button class="help-button" id="helpButton">?</button>
         </div>
         
@@ -1091,7 +1013,7 @@ if __name__ == "__main__":
                     <h3>How to Use Ruby</h3>
                     <p>
                         Paste references → Click Process → Review results: ✓ matched, ? ambiguous, ✗ unmatched<br>
-                        <small><em>Now with async processing and comprehensive search strategies!</em></small>
+                        <small><em>Note: Non-journal references may not be in PubMed</em></small>
                     </p>
                 </div>
                 
@@ -1140,7 +1062,7 @@ if __name__ == "__main__":
         </div>
         
         <div class="footer">
-            &copy; 2025 MGB Center for Quantitative Health • Because the robots will get us in the end but not today
+            &copy; 2025 MGB Center for Quantitative Health • The robots will get us in the end but not today
         </div>
     </div>
 
@@ -1149,7 +1071,7 @@ if __name__ == "__main__":
             <button class="close-button" id="closeModal">&times;</button>
             <h3>💎 Ruby</h3>
             <p>A tool to ensure references actually exist.</p>
-            <p>Now new and improved with async processing because why not.</p>
+            <p>Because AI lies. It will get us in the end, but not today.</p>
             <p><strong>&copy; 2025 MGB Center for Quantitative Health</strong></p>
         </div>
     </div>
@@ -1198,7 +1120,7 @@ if __name__ == "__main__":
                 this.processBtn.textContent = 'Processing...';
                 this.processBtn.style.background = 'var(--gray-400)';
                 this.processingStatus.classList.add('show');
-                this.outputArea.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--primary);">⚡ Processing references...</div>';
+                this.outputArea.innerHTML = '<div style="text-align: center; padding: 40px; color: var(--primary);">💎 Analyzing references...</div>';
                 this.updateDisplay(0, 0, 0);
             }
             
@@ -1251,8 +1173,9 @@ if __name__ == "__main__":
 </body>
 </html>""")
     
+    import os
     port = int(os.environ.get("PORT", 8000))
-    print(f"→ Starting Ruby Async Edition on port {port}")
+    print(f"→ Starting on port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 # Test function for debugging individual references
@@ -1264,12 +1187,7 @@ def test_single_reference(ref_text: str):
     print(f"Parsed - Title: '{ref.title}', Author: '{ref.first_author}', Year: '{ref.year}', Status: '{ref.status}'")
     
     if ref.status != "AMBIGUOUS":
-        # For testing, we'll use a simple async wrapper
-        async def test_async():
-            async with aiohttp.ClientSession() as session:
-                return await match_against_pubmed_async(session, ref)
-        
-        result = asyncio.run(test_async())
+        result = match_against_pubmed(ref)
         print(f"Final Result: {result.status}, PMID: {result.pmid}")
         if result.pmid:
             print(f"PubMed Title: {result.pubmed_title}")
@@ -1278,3 +1196,8 @@ def test_single_reference(ref_text: str):
         result = ref
     
     return result
+
+# Uncomment to test specific references:
+# test_single_reference("Fox CW, Albert AYK, Vines TH. Recruitment of reviewers is becoming harder at some journals: a test of the influence of reviewer fatigue at six journals in ecology and evolution. Res Integr Peer Rev. 2017;2(1):3. doi:10.1186/s41073-017-0027-x")
+# test_single_reference("Li ZQ, Xu HL, Cao HJ, Liu ZL, Fei YT, Liu JP. Use of Artificial Intelligence in Peer Review Among Top 100 Medical Journals. JAMA Netw Open. 2024;7(12):e2448609. doi:10.1001/jamanetworkopen.2024.48609")
+# test_single_reference("Rennie D, Flanagin A. Three Decades of Peer Review Congresses. JAMA. 2018;319(4):350-353. doi:10.1001/jama.2017.20606")
