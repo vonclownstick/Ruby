@@ -1,20 +1,25 @@
 #!/usr/bin/env python3
 """
 Ruby – PubMed Reference Verifier (Async Version - Pre-Batching)
+Enhanced with enterprise-level security features
 """
-import re, time, unicodedata, asyncio
+import re, time, unicodedata, asyncio, hashlib, secrets, logging
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
+from datetime import datetime, timedelta
 
 import aiohttp, uvicorn
 from Bio import Entrez
-from fastapi import FastAPI, Form, Request
-from fastapi.responses import HTMLResponse
+from fastapi import FastAPI, Form, Request, HTTPException, Depends, Response, status
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.templating import Jinja2Templates
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from jinja2 import TemplateNotFound
 from rapidfuzz import fuzz
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.responses import Response as StarletteResponse
 
-# ───────────────────────── SETTINGS ──────────────────────────
+# ───────────────────────── SECURITY CONFIGURATION ──────────────────────────
 import os
 try:
     from dotenv import load_dotenv
@@ -22,6 +27,37 @@ try:
 except ImportError:
     pass
 
+# Security Settings
+ACCESS_PASSWORD = os.environ.get("ACCESS_PASSWORD", "Cassowary")
+SESSION_SECRET = os.environ.get("SESSION_SECRET", secrets.token_urlsafe(32))
+SESSION_DURATION = 7 * 24 * 60 * 60  # 7 days in seconds
+MAX_LOGIN_ATTEMPTS = 5
+LOGIN_LOCKOUT_DURATION = 5 * 60  # 5 minutes in seconds
+CLEANUP_INTERVAL = 60 * 60  # 1 hour in seconds
+
+# Security Storage (In production, use Redis or database)
+AUTHENTICATED_SESSIONS: Set[str] = set()
+SESSION_DATA: Dict[str, Dict] = {}  # session_token -> {ip, created_at, last_access}
+LOGIN_ATTEMPTS: Dict[str, Dict] = {}  # ip -> {count, last_attempt, locked_until}
+
+# Security Headers
+SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-XSS-Protection": "1; mode=block",
+    "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
+    "Referrer-Policy": "strict-origin-when-cross-origin",
+    "Content-Security-Policy": "default-src 'self' 'unsafe-inline' 'unsafe-eval' fonts.googleapis.com fonts.gstatic.com"
+}
+
+# ───────────────────────── LOGGING SETUP ──────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+# ───────────────────────── ORIGINAL SETTINGS ──────────────────────────
 Entrez.email = os.environ.get("NCBI_EMAIL", "research@example.com")
 Entrez.api_key = os.environ.get("NCBI_API_KEY")
 
@@ -32,7 +68,146 @@ STRICT_THRESHOLD = 88
 LOOSE_THRESHOLD = 75
 MAX_CONCURRENT = 3  # Conservative concurrent processing
 
-# ───────────────────────── DATA ──────────────────────────────
+# ───────────────────────── SECURITY UTILITIES ─────────────────────────
+def get_client_ip(request: Request) -> str:
+    """Get client IP address with proxy support"""
+    forwarded = request.headers.get("X-Forwarded-For")
+    if forwarded:
+        return forwarded.split(",")[0].strip()
+    real_ip = request.headers.get("X-Real-IP")
+    if real_ip:
+        return real_ip.strip()
+    return request.client.host
+
+def create_session_token(ip: str) -> str:
+    """Create a cryptographically secure session token"""
+    timestamp = str(int(time.time()))
+    random_data = secrets.token_urlsafe(32)
+    data = f"{ip}:{timestamp}:{random_data}:{SESSION_SECRET}"
+    return hashlib.sha256(data.encode()).hexdigest()
+
+def is_session_valid(token: str, ip: str) -> bool:
+    """Validate session token and IP"""
+    if not token or token not in AUTHENTICATED_SESSIONS:
+        return False
+    
+    session_info = SESSION_DATA.get(token)
+    if not session_info:
+        return False
+    
+    # Check IP match
+    if session_info["ip"] != ip:
+        logger.warning(f"Session IP mismatch: expected {session_info['ip']}, got {ip}")
+        cleanup_session(token)
+        return False
+    
+    # Check expiration
+    if time.time() - session_info["created_at"] > SESSION_DURATION:
+        logger.info(f"Session expired for IP {ip}")
+        cleanup_session(token)
+        return False
+    
+    # Update last access
+    session_info["last_access"] = time.time()
+    return True
+
+def cleanup_session(token: str):
+    """Clean up a specific session"""
+    AUTHENTICATED_SESSIONS.discard(token)
+    SESSION_DATA.pop(token, None)
+
+def cleanup_expired_sessions():
+    """Clean up expired sessions and login attempts"""
+    current_time = time.time()
+    expired_tokens = []
+    
+    for token, info in SESSION_DATA.items():
+        if current_time - info["created_at"] > SESSION_DURATION:
+            expired_tokens.append(token)
+    
+    for token in expired_tokens:
+        cleanup_session(token)
+    
+    # Clean up old login attempts
+    expired_ips = []
+    for ip, attempt_info in LOGIN_ATTEMPTS.items():
+        if current_time - attempt_info["last_attempt"] > LOGIN_LOCKOUT_DURATION:
+            expired_ips.append(ip)
+    
+    for ip in expired_ips:
+        LOGIN_ATTEMPTS.pop(ip, None)
+    
+    if expired_tokens or expired_ips:
+        logger.info(f"Cleaned up {len(expired_tokens)} expired sessions and {len(expired_ips)} old login attempts")
+
+def is_ip_locked(ip: str) -> bool:
+    """Check if IP is locked due to too many failed attempts"""
+    if ip not in LOGIN_ATTEMPTS:
+        return False
+    
+    attempt_info = LOGIN_ATTEMPTS[ip]
+    if attempt_info["count"] >= MAX_LOGIN_ATTEMPTS:
+        if time.time() < attempt_info.get("locked_until", 0):
+            return True
+        else:
+            # Lock expired, reset attempts
+            LOGIN_ATTEMPTS[ip] = {"count": 0, "last_attempt": time.time(), "locked_until": 0}
+    
+    return False
+
+def record_login_attempt(ip: str, success: bool):
+    """Record login attempt and handle rate limiting"""
+    current_time = time.time()
+    
+    if ip not in LOGIN_ATTEMPTS:
+        LOGIN_ATTEMPTS[ip] = {"count": 0, "last_attempt": current_time, "locked_until": 0}
+    
+    if success:
+        # Reset on successful login
+        LOGIN_ATTEMPTS[ip] = {"count": 0, "last_attempt": current_time, "locked_until": 0}
+        logger.info(f"Successful login from IP {ip}")
+    else:
+        # Increment failed attempts
+        LOGIN_ATTEMPTS[ip]["count"] += 1
+        LOGIN_ATTEMPTS[ip]["last_attempt"] = current_time
+        
+        if LOGIN_ATTEMPTS[ip]["count"] >= MAX_LOGIN_ATTEMPTS:
+            LOGIN_ATTEMPTS[ip]["locked_until"] = current_time + LOGIN_LOCKOUT_DURATION
+            logger.warning(f"IP {ip} locked for {LOGIN_LOCKOUT_DURATION/60} minutes after {MAX_LOGIN_ATTEMPTS} failed attempts")
+        else:
+            logger.warning(f"Failed login attempt from IP {ip} (attempt {LOGIN_ATTEMPTS[ip]['count']}/{MAX_LOGIN_ATTEMPTS})")
+
+# ───────────────────────── SECURITY MIDDLEWARE ─────────────────────────
+class SecurityMiddleware(BaseHTTPMiddleware):
+    """Add security headers to all responses"""
+    
+    async def dispatch(self, request: Request, call_next):
+        response = await call_next(request)
+        
+        # Add security headers
+        for header, value in SECURITY_HEADERS.items():
+            response.headers[header] = value
+        
+        return response
+
+def get_session_token(request: Request) -> Optional[str]:
+    """Extract session token from cookies"""
+    return request.cookies.get("session_token")
+
+def require_auth(request: Request) -> str:
+    """Dependency to require authentication"""
+    token = get_session_token(request)
+    ip = get_client_ip(request)
+    
+    if not token or not is_session_valid(token, ip):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Authentication required"
+        )
+    
+    return token
+
+# ───────────────────────── ORIGINAL DATA STRUCTURES ──────────────────────────
 @dataclass
 class Reference:
     raw: str
@@ -45,7 +220,7 @@ class Reference:
     pubmed_first_author: str = ""
     pubmed_year: str = ""
 
-# ───────────────────────── UTILITIES ─────────────────────────
+# ───────────────────────── ORIGINAL UTILITIES ─────────────────────────
 def normalize(txt: str) -> str:
     txt = unicodedata.normalize("NFD", txt)
     txt = "".join(c for c in txt if unicodedata.category(c) != "Mn")
@@ -441,21 +616,106 @@ async def process_block_async(text: str) -> List[Reference]:
     
     return final_refs
 
-# ───────────────────────── FASTAPI / HTML ────────────────────
-app = FastAPI()
+# ───────────────────────── FASTAPI APPLICATION ────────────────────
+app = FastAPI(title="Ruby - PubMed Reference Verifier")
+
+# Add security middleware
+app.add_middleware(SecurityMiddleware)
+
 templates = Jinja2Templates(directory="templates")
 
+# ───────────────────────── SECURITY ENDPOINTS ────────────────────
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request, error: str = None):
+    """Display login page"""
+    ip = get_client_ip(request)
+    
+    # Check if already authenticated
+    token = get_session_token(request)
+    if token and is_session_valid(token, ip):
+        return RedirectResponse("/", status_code=302)
+    
+    # Check if IP is locked
+    if is_ip_locked(ip):
+        remaining_time = LOGIN_ATTEMPTS[ip].get("locked_until", 0) - time.time()
+        error = f"Too many failed attempts. Please try again in {int(remaining_time/60)} minutes."
+    
+    return templates.TemplateResponse("login.html", {
+        "request": request,
+        "error": error,
+        "max_attempts": MAX_LOGIN_ATTEMPTS
+    })
+
+@app.post("/login")
+async def login(request: Request, password: str = Form(...)):
+    """Handle login submission"""
+    ip = get_client_ip(request)
+    
+    # Check if IP is locked
+    if is_ip_locked(ip):
+        remaining_time = LOGIN_ATTEMPTS[ip].get("locked_until", 0) - time.time()
+        error = f"Too many failed attempts. Please try again in {int(remaining_time/60)} minutes."
+        return await login_page(request, error)
+    
+    # Validate password
+    if password == ACCESS_PASSWORD:
+        # Create session
+        session_token = create_session_token(ip)
+        AUTHENTICATED_SESSIONS.add(session_token)
+        SESSION_DATA[session_token] = {
+            "ip": ip,
+            "created_at": time.time(),
+            "last_access": time.time()
+        }
+        
+        record_login_attempt(ip, success=True)
+        
+        # Set secure cookie
+        response = RedirectResponse("/", status_code=302)
+        is_https = request.url.scheme == "https" or request.headers.get("X-Forwarded-Proto") == "https"
+        
+        response.set_cookie(
+            key="session_token",
+            value=session_token,
+            max_age=SESSION_DURATION,
+            httponly=True,
+            secure=is_https,  # Only send over HTTPS in production
+            samesite="strict"
+        )
+        
+        return response
+    else:
+        record_login_attempt(ip, success=False)
+        error = "Invalid password. Please try again."
+        return await login_page(request, error)
+
+@app.get("/logout")
+async def logout(request: Request):
+    """Handle logout"""
+    token = get_session_token(request)
+    if token:
+        cleanup_session(token)
+        logger.info(f"User logged out from IP {get_client_ip(request)}")
+    
+    response = RedirectResponse("/login", status_code=302)
+    response.delete_cookie("session_token")
+    return response
+
+# ───────────────────────── MAIN APPLICATION ENDPOINTS ────────────────────
 @app.get("/", response_class=HTMLResponse)
-async def root(request: Request):
+async def root(request: Request, _: str = Depends(require_auth)):
+    """Main application page - requires authentication"""
     return templates.TemplateResponse("index.html", {
         "request": request,
         "matched_count": 0,
         "ambiguous_count": 0,
-        "unmatched_count": 0
+        "unmatched_count": 0,
+        "logout_url": "/logout"
     })
 
 @app.post("/process", response_class=HTMLResponse)
-async def process_endpoint(request: Request, reference_text: str = Form(...)):
+async def process_endpoint(request: Request, reference_text: str = Form(...), _: str = Depends(require_auth)):
+    """Process references - requires authentication"""
     try:
         print(f"\n{'='*60}")
         print(f"Processing new request with {len(reference_text.splitlines())} lines")
@@ -523,6 +783,7 @@ async def process_endpoint(request: Request, reference_text: str = Form(...)):
             "matched_count": matched,
             "ambiguous_count": ambiguous,
             "unmatched_count": unmatched,
+            "logout_url": "/logout"
         })
     except TemplateNotFound:
         return HTMLResponse("Template not found", status_code=500)
@@ -532,20 +793,242 @@ async def process_endpoint(request: Request, reference_text: str = Form(...)):
         traceback.print_exc()
         return HTMLResponse(f"Error: {exc}", status_code=500)
 
-# ─────────────────────── EMBED TEMPLATE ───────────────
-if __name__ == "__main__":
-    import os, pathlib
+# ───────────────────────── STARTUP TASKS ────────────────────
+@app.on_event("startup")
+async def startup_event():
+    """Initialize security and cleanup tasks"""
+    logger.info("🔐 Ruby starting with enterprise security features")
+    logger.info(f"Session duration: {SESSION_DURATION/3600:.1f} hours")
+    logger.info(f"Login attempts limit: {MAX_LOGIN_ATTEMPTS}")
+    logger.info(f"Using password: {'Yes' if ACCESS_PASSWORD != 'Cassowary' else 'No (using default)'}")
     
-    # Always recreate the templates directory and file
+    # Start cleanup task
+    asyncio.create_task(periodic_cleanup())
+
+async def periodic_cleanup():
+    """Periodic cleanup of expired sessions and login attempts"""
+    while True:
+        await asyncio.sleep(CLEANUP_INTERVAL)
+        cleanup_expired_sessions()
+
+# ───────────────────────── EXCEPTION HANDLERS ────────────────────
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Custom exception handler for authentication errors"""
+    if exc.status_code == 401:
+        return RedirectResponse("/login", status_code=302)
+    
+    return HTMLResponse(f"Error: {exc.detail}", status_code=exc.status_code)
+
+# ─────────────────────── EMBED TEMPLATES ───────────────
+if __name__ == "__main__":
+    import pathlib, shutil
+    
+    # Always recreate the templates directory and files
     if os.path.exists("templates"):
-        import shutil
         shutil.rmtree("templates")
     
     os.makedirs("templates", exist_ok=True)
-    tpl = pathlib.Path("templates/index.html")
     
-    # Force write the new template
-    tpl.write_text("""\
+    # Login template
+    login_tpl = pathlib.Path("templates/login.html")
+    login_tpl.write_text("""\
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Login - Ruby PubMed Reference Verifier</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        
+        body {
+            font-family: 'Inter', sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+        
+        .login-container {
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.1);
+            padding: 40px;
+            max-width: 400px;
+            width: 100%;
+            text-align: center;
+        }
+        
+        .login-header {
+            margin-bottom: 30px;
+        }
+        
+        .login-header h1 {
+            color: #4f46e5;
+            font-size: 2.5rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+        }
+        
+        .login-header p {
+            color: #6b7280;
+            font-size: 1rem;
+        }
+        
+        .login-form {
+            display: flex;
+            flex-direction: column;
+            gap: 20px;
+        }
+        
+        .form-group {
+            text-align: left;
+        }
+        
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            color: #374151;
+        }
+        
+        input[type="password"] {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e5e7eb;
+            border-radius: 12px;
+            font-size: 16px;
+            transition: border-color 0.3s ease;
+            outline: none;
+        }
+        
+        input[type="password"]:focus {
+            border-color: #4f46e5;
+            box-shadow: 0 0 0 3px rgba(79, 70, 229, 0.1);
+        }
+        
+        .login-btn {
+            background: linear-gradient(135deg, #4f46e5 0%, #6366f1 100%);
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 12px;
+            font-size: 16px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            box-shadow: 0 4px 15px rgba(79, 70, 229, 0.3);
+        }
+        
+        .login-btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 20px rgba(79, 70, 229, 0.4);
+        }
+        
+        .login-btn:active {
+            transform: translateY(0);
+        }
+        
+        .error-message {
+            background: #fee2e2;
+            color: #dc2626;
+            padding: 12px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            font-size: 14px;
+            border: 1px solid #fecaca;
+        }
+        
+        .security-info {
+            margin-top: 20px;
+            padding: 16px;
+            background: #f0f9ff;
+            border-radius: 12px;
+            border: 1px solid #bae6fd;
+        }
+        
+        .security-info h3 {
+            color: #0369a1;
+            margin-bottom: 8px;
+            font-size: 14px;
+        }
+        
+        .security-info p {
+            color: #0369a1;
+            font-size: 12px;
+            line-height: 1.4;
+        }
+        
+        .footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #e5e7eb;
+            color: #6b7280;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div class="login-container">
+        <div class="login-header">
+            <h1>🔐 Ruby</h1>
+            <p>PubMed Reference Verifier</p>
+        </div>
+        
+        {% if error %}
+        <div class="error-message">
+            {{ error }}
+        </div>
+        {% endif %}
+        
+        <form method="post" class="login-form">
+            <div class="form-group">
+                <label for="password">Access Password</label>
+                <input type="password" name="password" id="password" required autofocus>
+            </div>
+            
+            <button type="submit" class="login-btn">Access Ruby →</button>
+        </form>
+        
+        <div class="security-info">
+            <h3>🛡️ Security Features</h3>
+            <p>• Sessions are IP-bound and expire after 7 days<br>
+            • Maximum {{ max_attempts }} login attempts per IP<br>
+            • Automatic lockout after failed attempts<br>
+            • Secure cookie-based authentication</p>
+        </div>
+        
+        <div class="footer">
+            &copy; 2025 MGB Center for Quantitative Health<br>
+            Enterprise Security Edition
+        </div>
+    </div>
+    
+    <script>
+        // Auto-focus password field
+        document.getElementById('password').focus();
+        
+        // Handle form submission
+        document.querySelector('.login-form').addEventListener('submit', function(e) {
+            const btn = document.querySelector('.login-btn');
+            btn.textContent = 'Authenticating...';
+            btn.disabled = true;
+        });
+    </script>
+</body>
+</html>""")
+    
+    # Main template (updated with logout button)
+    main_tpl = pathlib.Path("templates/index.html")
+    main_tpl.write_text("""\
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -631,16 +1114,21 @@ if __name__ == "__main__":
             letter-spacing: 0.5px;
         }
 
-        .help-button {
+        .header-buttons {
             position: absolute;
             top: 15px;
             right: 20px;
+            display: flex;
+            gap: 10px;
+            z-index: 2;
+        }
+
+        .header-btn {
             background: rgba(255, 255, 255, 0.15);
             border: 1px solid rgba(255, 255, 255, 0.2);
             border-radius: 50%;
             width: 40px;
             height: 40px;
-            font-size: 1.2rem;
             color: white;
             cursor: pointer;
             display: flex;
@@ -648,12 +1136,22 @@ if __name__ == "__main__":
             justify-content: center;
             transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
             backdrop-filter: blur(10px);
-            z-index: 2;
+            text-decoration: none;
+            font-size: 1.2rem;
         }
 
-        .help-button:hover {
+        .header-btn:hover {
             background: rgba(255, 255, 255, 0.25);
             transform: scale(1.1);
+        }
+
+        .logout-btn {
+            background: rgba(239, 68, 68, 0.2);
+            border-color: rgba(239, 68, 68, 0.3);
+        }
+
+        .logout-btn:hover {
+            background: rgba(239, 68, 68, 0.3);
         }
         
         .content {
@@ -1068,11 +1566,14 @@ if __name__ == "__main__":
                 padding: 20px;
             }
             
-            .help-button {
-                width: 36px;
-                height: 36px;
+            .header-buttons {
                 top: 12px;
                 right: 15px;
+            }
+            
+            .header-btn {
+                width: 36px;
+                height: 36px;
             }
         }
     </style>
@@ -1081,8 +1582,11 @@ if __name__ == "__main__":
     <div class="container">
         <div class="header">
             <h1>Ruby</h1>
-            <p class="subtitle">PubMed Reference Verifier - Async Edition</p>
-            <button class="help-button" id="helpButton">?</button>
+            <p class="subtitle">PubMed Reference Verifier - Secure Edition</p>
+            <div class="header-buttons">
+                <button class="header-btn" id="helpButton">?</button>
+                <a href="{{ logout_url }}" class="header-btn logout-btn" title="Logout">🔐</a>
+            </div>
         </div>
         
         <div class="content">
@@ -1091,7 +1595,7 @@ if __name__ == "__main__":
                     <h3>How to Use Ruby</h3>
                     <p>
                         Paste references → Click Process → Review results: ✓ matched, ? ambiguous, ✗ unmatched<br>
-                        <small><em>Now with async processing and comprehensive search strategies!</em></small>
+                        <small><em>Now with enterprise security and async processing!</em></small>
                     </p>
                 </div>
                 
@@ -1140,7 +1644,7 @@ if __name__ == "__main__":
         </div>
         
         <div class="footer">
-            &copy; 2025 MGB Center for Quantitative Health • Because the robots will get us in the end but not today
+            &copy; 2025 MGB Center for Quantitative Health • Enterprise Security Edition
         </div>
     </div>
 
@@ -1148,8 +1652,8 @@ if __name__ == "__main__":
         <div class="modal-content">
             <button class="close-button" id="closeModal">&times;</button>
             <h3>💎 Ruby</h3>
-            <p>A tool to ensure references actually exist.</p>
-            <p>Now new and improved with async processing because why not.</p>
+            <p>A secure tool to ensure references actually exist.</p>
+            <p>Now with enterprise-level security and async processing.</p>
             <p><strong>&copy; 2025 MGB Center for Quantitative Health</strong></p>
         </div>
     </div>
@@ -1252,7 +1756,9 @@ if __name__ == "__main__":
 </html>""")
     
     port = int(os.environ.get("PORT", 8000))
-    print(f"→ Starting Ruby Async Edition on port {port}")
+    print(f"🔐 Starting Ruby Secure Edition on port {port}")
+    print(f"Password: {'Custom' if ACCESS_PASSWORD != 'Cassowary' else 'Default (Cassowary)'}")
+    print(f"Session duration: {SESSION_DURATION/3600:.1f} hours")
     uvicorn.run(app, host="0.0.0.0", port=port)
 
 # Test function for debugging individual references

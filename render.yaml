@@ -1,10 +1,14 @@
 services:
   - type: web
-    name: ruby-pubmed-verifier
-    env: python
+    name: ruby-pubmed-secure
+    runtime: python3
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python app.py
-    envVars:
-      - key: PORT
-        value: 8000
+    healthCheckPath: /login
+    autoDeploy: true
+    regions:
+      - oregon
+    scaling:
+      minInstances: 1
+      maxInstances: 1
